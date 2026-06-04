@@ -1,0 +1,12 @@
+{
+  "name": "geovs",
+  "version": "1.0.0",
+  "description": "GEOVS — Geometric Versus: local-network 1v1 abstract puzzle game",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "dependencies": {
+    "ws": "^8.17.0"
+  }
+}
