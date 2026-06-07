@@ -1,6 +1,9 @@
 /**
- * GEOVS — Geometric Versus  |  Server v2
- * 5 difficulty levels, rich scoring, sabotage streaks
+ * GEOVS — server v3
+ * - Same pattern for both players
+ * - Round waits for BOTH to answer (or timeout)
+ * - First correct answer gets speed bonus; second correct gets smaller bonus
+ * - 2.5s between rounds
  */
 const http = require("http");
 const fs   = require("fs");
@@ -14,16 +17,15 @@ const httpServer = http.createServer((req, res) => {
     res.end(data);
   });
 });
-
 const wss = new WebSocketServer({ server: httpServer });
 
-// ── 5 levels: easy → legendary ─────────────────────────────────────────────
+// ── 5 levels ────────────────────────────────────────────────────────────────
 const LEVELS = [
-  { name:"EASY",      rounds:4,  timePerRound:18000, patternSize:2, basePoints:100, speedBonus:150 },
-  { name:"MEDIUM",    rounds:5,  timePerRound:14000, patternSize:3, basePoints:150, speedBonus:200 },
-  { name:"HARD",      rounds:6,  timePerRound:10000, patternSize:4, basePoints:200, speedBonus:300 },
-  { name:"EXPERT",    rounds:7,  timePerRound:7000,  patternSize:5, basePoints:300, speedBonus:450 },
-  { name:"LEGENDARY", rounds:8,  timePerRound:5000,  patternSize:6, basePoints:500, speedBonus:700 },
+  { name:"EASY",      rounds:5, timePerRound:15000, patternSize:2, basePoints:100, speedBonus:200 },
+  { name:"MEDIUM",    rounds:5, timePerRound:12000, patternSize:3, basePoints:150, speedBonus:250 },
+  { name:"HARD",      rounds:5, timePerRound:9000,  patternSize:4, basePoints:200, speedBonus:350 },
+  { name:"EXPERT",    rounds:5, timePerRound:6000,  patternSize:5, basePoints:300, speedBonus:500 },
+  { name:"LEGENDARY", rounds:5, timePerRound:4000,  patternSize:6, basePoints:500, speedBonus:800 },
 ];
 
 const SHAPES    = ["square","triangle","circle","diamond","cross","hexagon"];
@@ -31,13 +33,12 @@ const COLORS    = ["#FF2D55","#00F5C8","#FFD60A","#0A84FF","#FF9F0A","#BF5AF2","
 const ROTATIONS = [0, 45, 90, 135, 180];
 
 function seededRand(seed) {
-  let s = seed;
-  return () => { s = (s * 16807 + 0) % 2147483647; return (s - 1) / 2147483646; };
+  let s = seed; return () => { s=(s*16807)%2147483647; return (s-1)/2147483646; };
 }
 
-function generatePattern(size, roundSeed, playerIndex) {
-  const seed = roundSeed + playerIndex * 99991;
-  const rand = seededRand(seed);
+// SAME pattern for both players — no playerIndex salt
+function generatePattern(size, roundSeed) {
+  const rand = seededRand(roundSeed);
   const seq  = [];
   for (let i = 0; i < size + 1; i++) {
     seq.push({
@@ -59,170 +60,254 @@ function generatePattern(size, roundSeed, playerIndex) {
     };
     if (d.shape !== answer.shape || d.color !== answer.color) choices.push(d);
   }
-  for (let i = choices.length - 1; i > 0; i--) {
-    const j = Math.floor(rand() * (i + 1));
-    [choices[i], choices[j]] = [choices[j], choices[i]];
+  for (let i = choices.length-1; i > 0; i--) {
+    const j = Math.floor(rand()*(i+1));
+    [choices[i],choices[j]] = [choices[j],choices[i]];
   }
   return {
     sequence: seq.slice(0, size), answer, choices,
     correctIndex: choices.findIndex(c =>
-      c.shape === answer.shape && c.color === answer.color && c.rotation === answer.rotation
+      c.shape===answer.shape && c.color===answer.color && c.rotation===answer.rotation
     ),
   };
 }
 
 const lobbies = new Map();
-const makeLobbyId = () => Math.random().toString(36).slice(2, 7).toUpperCase();
+const makeLobbyId = () => Math.random().toString(36).slice(2,7).toUpperCase();
 
 function createLobby(id) {
-  return { id, players: [], level: 0, roundSeeds: [], phase: "waiting", roundTimers: [] };
+  return {
+    id, players: [], level: 0,
+    roundSeeds: [], phase: "waiting",
+    currentRound: 0,
+    roundAnswers: [],   // [{playerIndex, correct, timeTaken}]
+    roundTimer: null,
+    betweenTimer: null,
+  };
 }
 
 function broadcast(lobby, msg) {
   const d = JSON.stringify(msg);
-  lobby.players.forEach(p => { if (p.ws.readyState === 1) p.ws.send(d); });
+  lobby.players.forEach(p => { if (p.ws.readyState===1) p.ws.send(d); });
 }
-function sendTo(ws, msg) { if (ws.readyState === 1) ws.send(JSON.stringify(msg)); }
+function sendTo(ws, msg) { if (ws.readyState===1) ws.send(JSON.stringify(msg)); }
 
+// ── Start a level ────────────────────────────────────────────────────────────
 function startLevel(lobby) {
   const cfg = LEVELS[lobby.level];
-  lobby.roundSeeds = Array.from({ length: cfg.rounds }, () => Math.floor(Math.random() * 1e9));
-  lobby.players.forEach(p => { p.roundIndex = 0; p.streak = 0; });
+  lobby.roundSeeds = Array.from({length: cfg.rounds}, () => Math.floor(Math.random()*1e9));
+  lobby.players.forEach(p => { p.roundScores=[]; p.streak=0; });
+  lobby.currentRound = 0;
   lobby.phase = "countdown";
+
   broadcast(lobby, {
-    type: "countdown", seconds: 3,
+    type:"countdown", seconds:3,
     level: lobby.level, levelName: cfg.name,
-    seeds: lobby.roundSeeds, config: cfg,
-    players: lobby.players.map((p, i) => ({ name: p.name, score: p.score, playerIndex: i })),
+    seeds: lobby.roundSeeds,   // send ALL seeds to client upfront
+    config: cfg,
+    players: lobby.players.map((p,i) => ({name:p.name, score:p.score, playerIndex:i})),
   });
-  setTimeout(() => {
-    lobby.phase = "playing";
-    broadcast(lobby, { type: "roundStart", roundIndex: 0, timeLimit: cfg.timePerRound });
-    scheduleTimeout(lobby, 0);
-  }, 3300);
+
+  setTimeout(() => startRound(lobby, 0), 3300);
 }
 
-function scheduleTimeout(lobby, roundIndex) {
+// ── Start a round ────────────────────────────────────────────────────────────
+function startRound(lobby, roundIndex) {
   const cfg = LEVELS[lobby.level];
-  if (lobby.roundTimers[roundIndex]) clearTimeout(lobby.roundTimers[roundIndex]);
-  lobby.roundTimers[roundIndex] = setTimeout(() => {
-    lobby.players.forEach(p => {
-      if (p.roundIndex === roundIndex) {
-        p.streak = 0;
-        p.roundIndex++;
-        sendTo(p.ws, { type: "roundTimeout", roundIndex, score: p.score });
+  lobby.phase = "playing";
+  lobby.currentRound = roundIndex;
+  lobby.roundAnswers = [];   // reset answers for this round
+
+  broadcast(lobby, {
+    type: "roundStart",
+    roundIndex,
+    totalRounds: cfg.rounds,
+    timeLimit: cfg.timePerRound,
+    seed: lobby.roundSeeds[roundIndex],  // same seed → same pattern for both
+  });
+
+  // Auto-timeout if not everyone answers in time
+  if (lobby.roundTimer) clearTimeout(lobby.roundTimer);
+  lobby.roundTimer = setTimeout(() => {
+    // Force-submit anyone who hasn't answered
+    lobby.players.forEach((p, i) => {
+      const already = lobby.roundAnswers.find(a => a.playerIndex === i);
+      if (!already) {
+        lobby.roundAnswers.push({ playerIndex: i, choiceIndex: -1, timeTaken: cfg.timePerRound, correct: false, timedOut: true });
       }
     });
-    checkLevelComplete(lobby);
-  }, cfg.timePerRound + 1200);
+    resolveRound(lobby);
+  }, cfg.timePerRound + 500);
 }
 
-function advanceRound(lobby, player, playerIndex, roundIndex, choiceIndex, timeTaken) {
+// ── Called when a player submits an answer ───────────────────────────────────
+function submitAnswer(lobby, playerIndex, choiceIndex, timeTaken) {
   const cfg     = LEVELS[lobby.level];
-  const pattern = generatePattern(cfg.patternSize, lobby.roundSeeds[roundIndex], playerIndex);
+  const seed    = lobby.roundSeeds[lobby.currentRound];
+  const pattern = generatePattern(cfg.patternSize, seed);
   const correct = pattern.correctIndex === choiceIndex;
 
-  let points = 0;
-  if (correct) {
-    const timeRatio  = Math.max(0, 1 - timeTaken / cfg.timePerRound);
-    const speedPts   = Math.ceil(timeRatio * cfg.speedBonus);
-    player.streak    = (player.streak || 0) + 1;
-    const streakMult = Math.min(player.streak, 5);          // max 5× streak
-    const streakBonus= (streakMult - 1) * 50;               // +0,+50,+100,+150,+200
-    points = cfg.basePoints + speedPts + streakBonus;
-  } else {
-    player.streak = 0;
-  }
+  // Ignore duplicate answers
+  if (lobby.roundAnswers.find(a => a.playerIndex === playerIndex)) return;
 
-  player.score     += points;
-  player.roundIndex = roundIndex + 1;
+  lobby.roundAnswers.push({ playerIndex, choiceIndex, timeTaken, correct });
 
-  sendTo(player.ws, {
-    type: "roundResult", roundIndex, correct,
-    points, score: player.score, streak: player.streak,
+  // Tell this player immediately that their answer was received
+  sendTo(lobby.players[playerIndex].ws, {
+    type: "answerAck",
+    correct,
     correctIndex: pattern.correctIndex,
-    breakdown: correct ? { base: cfg.basePoints, speed: points - cfg.basePoints - (Math.min(player.streak,5)-1)*50, streak: (Math.min(player.streak,5)-1)*50 } : null,
+    roundIndex: lobby.currentRound,
   });
 
-  if (correct) {
-    const opp = lobby.players.find((_, i) => i !== playerIndex);
-    if (opp) sendTo(opp.ws, { type: "sabotage", seconds: player.streak >= 3 ? 3 : 2, fromPlayer: player.name, streak: player.streak });
+  // If both players have answered → resolve now
+  if (lobby.roundAnswers.length >= lobby.players.length) {
+    if (lobby.roundTimer) clearTimeout(lobby.roundTimer);
+    resolveRound(lobby);
   }
-
-  broadcast(lobby, {
-    type: "scoreUpdate",
-    players: lobby.players.map(p => ({ name: p.name, score: p.score, roundIndex: p.roundIndex, streak: p.streak || 0 })),
-  });
-
-  checkLevelComplete(lobby);
 }
 
-function checkLevelComplete(lobby) {
-  const cfg = LEVELS[lobby.level];
-  if (!lobby.players.every(p => p.roundIndex >= cfg.rounds)) return;
-  lobby.roundTimers.forEach(t => clearTimeout(t));
-  lobby.roundTimers = [];
+// ── Resolve round — score everyone, send results, schedule next round ────────
+function resolveRound(lobby) {
+  const cfg       = LEVELS[lobby.level];
+  const roundIndex = lobby.currentRound;
+  const seed      = lobby.roundSeeds[roundIndex];
+  const pattern   = generatePattern(cfg.patternSize, seed);
 
+  // Sort correct answers by time (fastest first)
+  const correctAnswers = lobby.roundAnswers
+    .filter(a => a.correct)
+    .sort((a, b) => a.timeTaken - b.timeTaken);
+
+  const results = lobby.players.map((p, i) => {
+    const ans     = lobby.roundAnswers.find(a => a.playerIndex === i) || { correct:false, timeTaken:cfg.timePerRound, timedOut:true };
+    let points    = 0;
+    let breakdown = null;
+
+    if (ans.correct) {
+      const position    = correctAnswers.findIndex(a => a.playerIndex === i); // 0=first, 1=second
+      const timeRatio   = Math.max(0, 1 - ans.timeTaken / cfg.timePerRound);
+      const speedPts    = Math.ceil(timeRatio * cfg.speedBonus);
+      const positionMult= position === 0 ? 1.0 : 0.6;  // first correct = full, second = 60%
+      p.streak          = (p.streak||0) + 1;
+      const streakBonus = Math.min(p.streak - 1, 4) * 50;
+      points = Math.ceil((cfg.basePoints + speedPts) * positionMult) + streakBonus;
+      breakdown = {
+        base: Math.ceil(cfg.basePoints * positionMult),
+        speed: Math.ceil(speedPts * positionMult),
+        streak: streakBonus,
+        firstBonus: position === 0,
+      };
+    } else {
+      p.streak = 0;
+    }
+
+    p.score += points;
+    p.roundScores.push(points);
+
+    return {
+      playerIndex: i,
+      name: p.name,
+      correct: ans.correct,
+      timedOut: ans.timedOut || false,
+      choiceIndex: ans.choiceIndex,
+      points,
+      score: p.score,
+      streak: p.streak,
+      breakdown,
+    };
+  });
+
+  lobby.phase = "roundEnd";
+
+  broadcast(lobby, {
+    type: "roundEnd",
+    roundIndex,
+    correctIndex: pattern.correctIndex,
+    results,
+    players: lobby.players.map(p => ({name:p.name, score:p.score, streak:p.streak||0})),
+  });
+
+  // Schedule next round or level end
+  const nextRound = roundIndex + 1;
+  if (lobby.betweenTimer) clearTimeout(lobby.betweenTimer);
+
+  if (nextRound < cfg.rounds) {
+    lobby.betweenTimer = setTimeout(() => startRound(lobby, nextRound), 2800);
+  } else {
+    lobby.betweenTimer = setTimeout(() => endLevel(lobby), 2800);
+  }
+}
+
+// ── End level ────────────────────────────────────────────────────────────────
+function endLevel(lobby) {
   if (lobby.level >= LEVELS.length - 1) {
     lobby.phase = "gameOver";
-    const sorted = [...lobby.players].sort((a, b) => b.score - a.score);
+    const sorted = [...lobby.players].sort((a,b) => b.score - a.score);
     broadcast(lobby, {
       type: "gameOver",
-      players: lobby.players.map(p => ({ name: p.name, score: p.score })),
+      players: lobby.players.map(p => ({name:p.name, score:p.score})),
       winner: sorted[0].name,
-      draw: sorted[0].score === sorted[1]?.score,
+      draw: sorted[0].score === (sorted[1]?.score||0),
     });
   } else {
     lobby.phase = "levelEnd";
     broadcast(lobby, {
-      type: "levelEnd", level: lobby.level,
-      nextLevelName: LEVELS[lobby.level + 1].name,
-      players: lobby.players.map(p => ({ name: p.name, score: p.score })),
+      type: "levelEnd",
+      level: lobby.level,
+      nextLevelName: LEVELS[lobby.level+1].name,
+      players: lobby.players.map(p => ({name:p.name, score:p.score})),
     });
-    setTimeout(() => { lobby.level++; startLevel(lobby); }, 6000);
+    setTimeout(() => { lobby.level++; startLevel(lobby); }, 5000);
   }
 }
 
+// ── WebSocket connections ────────────────────────────────────────────────────
 wss.on("connection", (ws) => {
   let playerLobby = null, playerRef = null, playerIndex = -1;
 
   ws.on("message", (raw) => {
     let msg; try { msg = JSON.parse(raw); } catch { return; }
+
     switch (msg.type) {
       case "createLobby": {
         const id = makeLobbyId(), lobby = createLobby(id);
         lobbies.set(id, lobby);
-        playerRef = { ws, name: (msg.name||"PLAYER_01").slice(0,12), score: 0, roundIndex: 0, streak: 0 };
-        playerIndex = 0; lobby.players.push(playerRef); playerLobby = lobby;
-        sendTo(ws, { type: "lobbyCreated", lobbyId: id, playerIndex: 0, name: playerRef.name });
+        playerRef   = { ws, name:(msg.name||"PLAYER_01").slice(0,12), score:0, streak:0, roundScores:[] };
+        playerIndex = 0;
+        lobby.players.push(playerRef);
+        playerLobby = lobby;
+        sendTo(ws, {type:"lobbyCreated", lobbyId:id, playerIndex:0, name:playerRef.name});
         break;
       }
       case "joinLobby": {
         const lobby = lobbies.get(msg.lobbyId?.toUpperCase());
-        if (!lobby)                    { sendTo(ws, { type: "error", msg: "Lobby not found" });     return; }
-        if (lobby.players.length >= 2) { sendTo(ws, { type: "error", msg: "Lobby is full" });       return; }
-        if (lobby.phase !== "waiting") { sendTo(ws, { type: "error", msg: "Game already started" }); return; }
-        playerRef = { ws, name: (msg.name||"PLAYER_02").slice(0,12), score: 0, roundIndex: 0, streak: 0 };
-        playerIndex = 1; lobby.players.push(playerRef); playerLobby = lobby;
-        sendTo(ws, { type: "lobbyJoined", lobbyId: lobby.id, playerIndex: 1, name: playerRef.name });
-        broadcast(lobby, { type: "playerJoined", players: lobby.players.map(p => ({ name: p.name })) });
+        if (!lobby)                    { sendTo(ws,{type:"error",msg:"Lobby not found"});    return; }
+        if (lobby.players.length >= 2) { sendTo(ws,{type:"error",msg:"Lobby is full"});      return; }
+        if (lobby.phase !== "waiting") { sendTo(ws,{type:"error",msg:"Game already started"});return; }
+        playerRef   = { ws, name:(msg.name||"PLAYER_02").slice(0,12), score:0, streak:0, roundScores:[] };
+        playerIndex = 1;
+        lobby.players.push(playerRef);
+        playerLobby = lobby;
+        sendTo(ws, {type:"lobbyJoined", lobbyId:lobby.id, playerIndex:1, name:playerRef.name});
+        broadcast(lobby, {type:"playerJoined", players:lobby.players.map(p=>({name:p.name}))});
         setTimeout(() => startLevel(lobby), 800);
         break;
       }
       case "answer": {
-        if (!playerLobby || !playerRef) return;
+        if (!playerLobby || playerLobby.phase !== "playing") return;
         const { roundIndex, choiceIndex, timeTaken } = msg;
-        if (playerRef.roundIndex !== roundIndex) return;
-        advanceRound(playerLobby, playerRef, playerIndex, roundIndex, choiceIndex, timeTaken);
+        if (roundIndex !== playerLobby.currentRound) return;
+        submitAnswer(playerLobby, playerIndex, choiceIndex, timeTaken);
         break;
       }
       case "restartGame": {
         if (!playerLobby) return;
-        playerLobby.roundTimers.forEach(t => clearTimeout(t));
-        playerLobby.roundTimers = [];
+        if (playerLobby.roundTimer)   clearTimeout(playerLobby.roundTimer);
+        if (playerLobby.betweenTimer) clearTimeout(playerLobby.betweenTimer);
         playerLobby.level = 0;
         playerLobby.phase = "waiting";
-        playerLobby.players.forEach(p => { p.score = 0; p.roundIndex = 0; p.streak = 0; });
+        playerLobby.players.forEach(p => { p.score=0; p.streak=0; p.roundScores=[]; });
         setTimeout(() => startLevel(playerLobby), 300);
         break;
       }
@@ -231,11 +316,13 @@ wss.on("connection", (ws) => {
 
   ws.on("close", () => {
     if (!playerLobby) return;
-    broadcast(playerLobby, { type: "playerLeft", name: playerRef?.name });
+    if (playerLobby.roundTimer)   clearTimeout(playerLobby.roundTimer);
+    if (playerLobby.betweenTimer) clearTimeout(playerLobby.betweenTimer);
+    broadcast(playerLobby, {type:"playerLeft", name:playerRef?.name});
     playerLobby.players = playerLobby.players.filter(p => p !== playerRef);
     if (playerLobby.players.length === 0) lobbies.delete(playerLobby.id);
   });
 });
 
 const PORT = process.env.PORT || 3000;
-httpServer.listen(PORT, "0.0.0.0", () => console.log(`\nGEOVS server on port ${PORT}\n`));
+httpServer.listen(PORT, "0.0.0.0", () => console.log(`GEOVS server on port ${PORT}`));
